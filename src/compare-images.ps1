@@ -1,234 +1,438 @@
 param(
-    [string]$baseline,
-    [string]$current,
-    [string]$output            = "diff.png",
+    [Parameter(Mandatory = $true)]
+    [string]$Baseline,
 
-    # 灰階差異門檻 (%)：大於這個亮度差的 pixel 算「有差」（粉色那條）
-    [int]   $thresholdPercent  = 2,
+    [Parameter(Mandatory = $true)]
+    [string]$Current,
 
-    # 模糊半徑 (像素)：0 = 不模糊，1~2 可去掉一點噪點（同時用在兩個 mask 上）
-    [int]   $blurRadius        = 0,
+    [string]$Output = "diff.png",
 
-    # Diff coverage PASS/FAIL 門檻 (%)
-    [double]$coverageThreshold = 0.1,
+    [ValidateRange(0, 100)]
+    [double]$PixelThresholdPercent = 2.0,
 
-    # FUZZ 對應的差異門檻 (%)，用來做「FUZZ mask」
-    # 0 代表只要有差就算（用 threshold 0%）
-    [int]   $metricFuzzPercent = 0,
+    [ValidateRange(0, 20)]
+    [double]$BlurRadius = 0.0,
 
-    # AE 佔比 PASS/FAIL 門檻 (%)
-    [double]$aeMaxPercent      = 0.1
+    [ValidateRange(0, 100)]
+    [double]$CoverageLimitPercent = 0.1,
+
+    [ValidateRange(0, 100)]
+    [double]$FuzzPercent = 0.0,
+
+    [ValidateRange(0, 100)]
+    [double]$AELimitPercent = 0.1,
+
+    [string]$ReportPath = ""
 )
 
-$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
 
-# --------- 工具：數字顯示成最多小數點後 3 位 ---------
-function Format-Num3 {
-    param([double]$x)
-    return ('{0:0.###}' -f $x)
+function ConvertTo-InvariantDouble {
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    $token = ($Value.Trim() -split '\s+')[0]
+
+    return [double]::Parse(
+        $token,
+        [System.Globalization.CultureInfo]::InvariantCulture
+    )
 }
 
-# --------- 工具：安全轉 double ---------
-function Parse-Double {
-    param([string]$text)
+function Format-Percent {
+    param([double]$Value)
 
-    if (-not $text) { return 0.0 }
-
-    $text  = $text.Trim()
-    $token = $text.Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)[0]
-
-    return [double]::Parse($token, [System.Globalization.CultureInfo]::InvariantCulture)
+    return $Value.ToString(
+        "0.###",
+        [System.Globalization.CultureInfo]::InvariantCulture
+    )
 }
 
-# --------- 工具：取得 AE (會吃 fuzz) ---------
-function Get-AE {
+function Assert-ImageMagick {
+    $command = Get-Command magick -ErrorAction SilentlyContinue
+
+    if (-not $command) {
+        throw "ImageMagick was not found. Install ImageMagick and make sure 'magick' is available in PATH."
+    }
+}
+
+function Get-ImageDimensions {
     param(
-        [Parameter(Mandatory)][string]$base,
-        [Parameter(Mandatory)][string]$curr
+        [Parameter(Mandatory = $true)]
+        [string]$Path
     )
 
-    $oldPref = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        $args = @('compare')
-        if ($metricFuzzPercent -gt 0) {
-            $args += '-fuzz'
-            $args += ("{0}%%" -f $metricFuzzPercent)  # 例如 "2%"
-        }
-        $args += @('-metric', 'AE', $base, $curr, 'null:')
+    $raw = (& magick identify -format "%w %h" -- "$Path").Trim()
 
-        $raw = & magick @args 2>&1
+    if (-not $raw) {
+        throw "Unable to read image dimensions: $Path"
+    }
+
+    $parts = $raw -split '\s+'
+
+    if ($parts.Count -ne 2) {
+        throw "Unexpected dimension output for: $Path"
+    }
+
+    return [pscustomobject]@{
+        Width  = [int]$parts[0]
+        Height = [int]$parts[1]
+    }
+}
+
+function Get-AECount {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ReferencePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TestPath,
+
+        [double]$TolerancePercent
+    )
+
+    $oldPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+
+    try {
+        $arguments = @("compare")
+
+        if ($TolerancePercent -gt 0) {
+            $arguments += @(
+                "-fuzz",
+                ("{0}%" -f $TolerancePercent)
+            )
+        }
+
+        $arguments += @(
+            "-metric",
+            "AE",
+            $ReferencePath,
+            $TestPath,
+            "null:"
+        )
+
+        $raw = & magick @arguments 2>&1
     }
     finally {
-        $ErrorActionPreference = $oldPref
+        $ErrorActionPreference = $oldPreference
     }
 
-    if (-not $raw) { return $null }
+    if (-not $raw) {
+        throw "ImageMagick did not return an AE value."
+    }
 
-    $line = ($raw | Select-Object -First 1).ToString().Trim()
-    if (-not $line) { return $null }
+    $firstLine = ($raw | Select-Object -First 1).ToString().Trim()
 
-    return Parse-Double $line
+    return ConvertTo-InvariantDouble $firstLine
 }
 
-# --------- 檢查路徑 ---------
-if (-not (Test-Path $baseline)) {
-    Write-Host "Baseline image not found: $baseline" -ForegroundColor Red
-    exit 1
+function Write-CheckResult {
+    param(
+        [string]$Name,
+        [bool]$Passed,
+        [string]$Message
+    )
+
+    $label = if ($Passed) { "PASS" } else { "FAIL" }
+    $color = if ($Passed) { "Green" } else { "Red" }
+
+    Write-Host (
+        "[{0}] {1}: {2}" -f
+        $label,
+        $Name,
+        $Message
+    ) -ForegroundColor $color
 }
-if (-not (Test-Path $current)) {
-    Write-Host "Current image not found:  $current" -ForegroundColor Red
-    exit 1
+
+Assert-ImageMagick
+
+if (-not (Test-Path -LiteralPath $Baseline -PathType Leaf)) {
+    throw "Baseline image not found: $Baseline"
 }
 
-# --------- 暫存檔 ---------
-$baseResized  = Join-Path $env:TEMP "_cmp_base_resized.png"
-$currResized  = Join-Path $env:TEMP "_cmp_curr_resized.png"
-$diffGray     = Join-Path $env:TEMP "_cmp_diff_gray.png"
+if (-not (Test-Path -LiteralPath $Current -PathType Leaf)) {
+    throw "Current image not found: $Current"
+}
 
-$maskT        = Join-Path $env:TEMP "_cmp_mask_threshold.png"   # Threshold 用
-$maskF        = Join-Path $env:TEMP "_cmp_mask_fuzz.png"        # FUZZ 用
+$dimensions = Get-ImageDimensions -Path $Baseline
 
-$maskOverlap  = Join-Path $env:TEMP "_cmp_mask_overlap.png"     # T ∧ F
-$maskOnlyT    = Join-Path $env:TEMP "_cmp_mask_onlyT.png"       # 只 Threshold
-$maskOnlyF    = Join-Path $env:TEMP "_cmp_mask_onlyF.png"       # 只 FUZZ
+$totalPixels =
+    [double]$dimensions.Width *
+    [double]$dimensions.Height
 
-$tintT        = Join-Path $env:TEMP "_cmp_tint_threshold.png"   # 粉
-$tintF        = Join-Path $env:TEMP "_cmp_tint_fuzz.png"        # 藍
-$tintO        = Join-Path $env:TEMP "_cmp_tint_overlap.png"     # 綠
+$tempRoot = Join-Path `
+    ([System.IO.Path]::GetTempPath()) `
+    ("visual-regression-" + [guid]::NewGuid().ToString("N"))
 
-$baseShaded   = Join-Path $env:TEMP "_cmp_base_shaded.png"
-$tmp1         = Join-Path $env:TEMP "_cmp_tmp1.png"
-$tmp2         = Join-Path $env:TEMP "_cmp_tmp2.png"
+New-Item `
+    -ItemType Directory `
+    -Path $tempRoot |
+    Out-Null
+
+$baselineNormalized = Join-Path $tempRoot "baseline.png"
+$currentNormalized  = Join-Path $tempRoot "current.png"
+$differenceImage    = Join-Path $tempRoot "difference.png"
+$thresholdMask      = Join-Path $tempRoot "mask.png"
+$lightBaseline      = Join-Path $tempRoot "baseline-light.png"
+$highlightLayer     = Join-Path $tempRoot "highlight.png"
 
 try {
-    # ===== 1) 尺寸對齊：以 baseline 為基準 =====
-    $sizeStr = & magick identify -format "%w %h" "$baseline"
-    if (-not $sizeStr) {
-        Write-Host "Failed to read baseline size." -ForegroundColor Red
-        exit 1
-    }
-    $parts = $sizeStr.Trim().Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
-    [int]$width  = $parts[0]
-    [int]$height = $parts[1]
-    [double]$totalPixels = [double]$width * [double]$height
 
-    & magick "$baseline" -resize "${width}x${height}!" "$baseResized"
-    & magick "$current"  -resize "${width}x${height}!" "$currResized"
+    # Normalize both images to the baseline size.
+    & magick `
+        $Baseline `
+        -auto-orient `
+        -colorspace sRGB `
+        -resize ("{0}x{1}!" -f $dimensions.Width, $dimensions.Height) `
+        $baselineNormalized
 
-    # ===== 2) 灰階差異圖 =====
-    & magick "$baseResized" "$currResized" -compose Difference -composite -colorspace Gray "$diffGray"
+    & magick `
+        $Current `
+        -auto-orient `
+        -colorspace sRGB `
+        -resize ("{0}x{1}!" -f $dimensions.Width, $dimensions.Height) `
+        $currentNormalized
 
-    # ===== 3) 兩種門檻的 mask：Threshold 用 (粉) & FUZZ 用 (藍) =====
-    if ($blurRadius -gt 0) {
-        & magick "$diffGray" -blur 0x$blurRadius -threshold ("{0}%%" -f $thresholdPercent) "$maskT"
-    } else {
-        & magick "$diffGray" -threshold ("{0}%%" -f $thresholdPercent) "$maskT"
-    }
 
-    $fuzzThrStr = if ($metricFuzzPercent -le 0) { "0%" } else { ("{0}%%" -f $metricFuzzPercent) }
-    if ($blurRadius -gt 0) {
-        & magick "$diffGray" -blur 0x$blurRadius -threshold $fuzzThrStr "$maskF"
-    } else {
-        & magick "$diffGray" -threshold $fuzzThrStr "$maskF"
-    }
+    # Create grayscale difference image.
+    & magick `
+        $baselineNormalized `
+        $currentNormalized `
+        -compose Difference `
+        -composite `
+        -colorspace Gray `
+        $differenceImage
 
-    # ===== 4) coverage 計算（用 Threshold 的 mask）=====
-    $meanStr = & magick "$maskT" -format "%[fx:mean]" info:
-    $meanVal = Parse-Double $meanStr
-    $diffPixels = [long]([math]::Round($meanVal * $totalPixels))
-    $coverage   = $meanVal * 100.0
 
-    $covStr     = Format-Num3 $coverage
-    $totalPix_i = [long]$totalPixels
+    # Build threshold mask.
+    $maskArguments = @(
+        $differenceImage
+    )
 
-    Write-Host ("Diff coverage : {0} percent  ({1} / {2} pixels)" -f $covStr, $diffPixels, $totalPix_i)
-
-    $covThrStr = Format-Num3 $coverageThreshold
-    $covPass   = ($coverage -lt $coverageThreshold)
-    if ($covPass) {
-        Write-Host ("[COVERAGE] PASS : coverage {0} < threshold {1} percent" -f $covStr, $covThrStr) -ForegroundColor Green
-    } else {
-        Write-Host ("[COVERAGE] FAIL : coverage {0} >= threshold {1} percent" -f $covStr, $covThrStr) -ForegroundColor Red
+    if ($BlurRadius -gt 0) {
+        $maskArguments += @(
+            "-blur",
+            ("0x{0}" -f $BlurRadius)
+        )
     }
 
-    # ===== 5) 先「分類」再上色：每個 pixel 只屬於一種 =====
-    # u = Threshold mask, v = FUZZ mask，兩張都是 0 or 1 (經過 threshold 後)
-    # Overlap : T && F
-    & magick "$maskT" "$maskF" -fx 't = (u>0.5); f = (v>0.5); t && f ? 1 : 0' "$maskOverlap"
-    # OnlyT   : T && !F
-    & magick "$maskT" "$maskF" -fx 't = (u>0.5); f = (v>0.5); t && !f ? 1 : 0' "$maskOnlyT"
-    # OnlyF   : F && !T
-    & magick "$maskT" "$maskF" -fx 't = (u>0.5); f = (v>0.5); f && !t ? 1 : 0' "$maskOnlyF"
+    $maskArguments += @(
+        "-threshold",
+        ("{0}%" -f $PixelThresholdPercent),
+        $thresholdMask
+    )
 
-    # ===== 6) 視覺化：白底 + 粉 / 藍 / 綠 =====
-    # 6a) baseline 整體洗白
-    & magick "$baseResized" -fill white -colorize 60 "$baseShaded"
+    & magick @maskArguments
 
-    # 6b) 粉色（只 Threshold）
-    & magick "$maskOnlyT" `
-        -alpha copy `
-        -fill "#ff00ff" -colorize 100 `
-        -channel A -evaluate multiply 0.6 +channel `
-        "$tintT"
 
-    # 6c) 藍色（只 FUZZ）
-    & magick "$maskOnlyF" `
-        -alpha copy `
-        -fill "#0000ff" -colorize 100 `
-        -channel A -evaluate multiply 0.6 +channel `
-        "$tintF"
+    # Binary mask mean = changed pixel ratio.
+    $maskMeanText =
+        (& magick `
+            $thresholdMask `
+            -format "%[fx:mean]" `
+            info:
+        ).Trim()
 
-    # 6d) 綠色（兩者重疊）
-    & magick "$maskOverlap" `
-        -alpha copy `
-        -fill "#00ff00" -colorize 100 `
-        -channel A -evaluate multiply 0.6 +channel `
-        "$tintO"
+    $maskMean =
+        ConvertTo-InvariantDouble $maskMeanText
 
-    # 6e) 疊合：先粉 → 再藍 → 再綠（但因為三張 mask 已互斥，所以不會再互相蓋色）
-    & magick "$baseShaded" "$tintT" -compose Over -composite "$tmp1"
-    & magick "$tmp1"       "$tintF" -compose Over -composite "$tmp2"
-    & magick "$tmp2"       "$tintO" -compose Over -composite "$output"
+    $changedPixels =
+        [long][math]::Round(
+            $maskMean * $totalPixels
+        )
 
-    # ===== 7) AE (with fuzz) =====
-    Write-Host ""
-    Write-Host ("==== AE metric (with fuzz = {0}% ) ====" -f $metricFuzzPercent)
+    $coveragePercent =
+        $maskMean * 100.0
 
-    $aeRaw = Get-AE -base $baseResized -curr $currResized
 
-    if ($aeRaw -eq $null) {
-        Write-Host "AE : N/A (compare failed)" -ForegroundColor Yellow
-        $aePass = $false
-    } else {
-        $aePercent = if ($totalPixels -gt 0) {
-            100.0 * $aeRaw / $totalPixels
-        } else { 0.0 }
+    # AE metric with ImageMagick fuzz tolerance.
+    $aeCount =
+        Get-AECount `
+            -ReferencePath $baselineNormalized `
+            -TestPath $currentNormalized `
+            -TolerancePercent $FuzzPercent
 
-        $aePercentStr = Format-Num3 $aePercent
-        $aeMaxStr     = Format-Num3 $aeMaxPercent
-
-        Write-Host ("AE : {0} pixels ({1} percent of image)" -f ([long]$aeRaw), $aePercentStr)
-
-        $aePass = ($aePercent -le $aeMaxPercent)
-        if ($aePass) {
-            Write-Host ("[AE] PASS : {0} <= {1} percent" -f $aePercentStr, $aeMaxStr) -ForegroundColor Green
-        } else {
-            Write-Host ("[AE] FAIL : {0} > {1} percent" -f $aePercentStr, $aeMaxStr) -ForegroundColor Red
+    $aePercent =
+        if ($totalPixels -gt 0) {
+            100.0 * $aeCount / $totalPixels
         }
+        else {
+            0.0
+        }
+
+
+    # PASS / FAIL.
+    $coveragePassed =
+        $coveragePercent -le $CoverageLimitPercent
+
+    $aePassed =
+        $aePercent -le $AELimitPercent
+
+    $overallPassed =
+        $coveragePassed -and $aePassed
+
+
+    # Visual result:
+    # changed pixels are highlighted in magenta.
+    & magick `
+        $baselineNormalized `
+        -fill white `
+        -colorize 55 `
+        $lightBaseline
+
+    & magick `
+        $thresholdMask `
+        -alpha copy `
+        -fill "#ff00ff" `
+        -colorize 100 `
+        -channel A `
+        -evaluate multiply 0.65 `
+        +channel `
+        $highlightLayer
+
+    & magick `
+        $lightBaseline `
+        $highlightLayer `
+        -compose Over `
+        -composite `
+        $Output
+
+
+    Write-Host ""
+    Write-Host "=== Visual Regression Result ==="
+
+    Write-Host (
+        "Baseline size : {0} x {1}" -f
+        $dimensions.Width,
+        $dimensions.Height
+    )
+
+    Write-Host (
+        "Changed pixels: {0} / {1}" -f
+        $changedPixels,
+        [long]$totalPixels
+    )
+
+    Write-Host (
+        "Diff coverage : {0}%" -f
+        (Format-Percent $coveragePercent)
+    )
+
+    Write-Host (
+        "AE difference : {0} pixels ({1}%) with fuzz={2}%" -f
+        [long]$aeCount,
+        (Format-Percent $aePercent),
+        (Format-Percent $FuzzPercent)
+    )
+
+    Write-Host (
+        "Diff image    : {0}" -f
+        $Output
+    )
+
+    Write-Host ""
+
+
+    Write-CheckResult `
+        -Name "Coverage" `
+        -Passed $coveragePassed `
+        -Message (
+            "{0}% <= limit {1}%" -f
+            (Format-Percent $coveragePercent),
+            (Format-Percent $CoverageLimitPercent)
+        )
+
+    Write-CheckResult `
+        -Name "AE" `
+        -Passed $aePassed `
+        -Message (
+            "{0}% <= limit {1}%" -f
+            (Format-Percent $aePercent),
+            (Format-Percent $AELimitPercent)
+        )
+
+    Write-CheckResult `
+        -Name "Overall" `
+        -Passed $overallPassed `
+        -Message $(
+            if ($overallPassed) {
+                "all checks passed"
+            }
+            else {
+                "one or more checks exceeded the configured limits"
+            }
+        )
+
+
+    # Optional JSON report.
+    if ($ReportPath) {
+
+        $report = [ordered]@{
+
+            baseline = $Baseline
+            current  = $Current
+            output   = $Output
+
+            image = [ordered]@{
+                width        = $dimensions.Width
+                height       = $dimensions.Height
+                total_pixels = [long]$totalPixels
+            }
+
+            settings = [ordered]@{
+                pixel_threshold_percent = $PixelThresholdPercent
+                blur_radius             = $BlurRadius
+                coverage_limit_percent  = $CoverageLimitPercent
+                fuzz_percent            = $FuzzPercent
+                ae_limit_percent        = $AELimitPercent
+            }
+
+            metrics = [ordered]@{
+                changed_pixels   = $changedPixels
+                coverage_percent = [math]::Round(
+                    $coveragePercent,
+                    6
+                )
+                ae_pixels = [long]$aeCount
+                ae_percent = [math]::Round(
+                    $aePercent,
+                    6
+                )
+            }
+
+            pass = [ordered]@{
+                coverage = $coveragePassed
+                ae       = $aePassed
+                overall  = $overallPassed
+            }
+        }
+
+        $report |
+            ConvertTo-Json -Depth 6 |
+            Set-Content `
+                -LiteralPath $ReportPath `
+                -Encoding UTF8
+
+        Write-Host (
+            "JSON report   : {0}" -f
+            $ReportPath
+        )
     }
 
-    # ===== 8) 總結 Result =====
-    Write-Host ""
-    if ($covPass -and $aePass) {
-        Write-Host "Result: PASS (coverage + AE both within limits)" -ForegroundColor Green
-    } else {
-        Write-Host "Result: FAIL (either coverage or AE exceeds limits)" -ForegroundColor Red
+
+    if ($overallPassed) {
+        exit 0
+    }
+    else {
+        exit 2
     }
 }
 finally {
-    Remove-Item $baseResized, $currResized, $diffGray, `
-                $maskT, $maskF, $maskOverlap, $maskOnlyT, $maskOnlyF, `
-                $tintT, $tintF, $tintO, $baseShaded, $tmp1, $tmp2 `
-                -ErrorAction SilentlyContinue
+
+    Remove-Item `
+        -LiteralPath $tempRoot `
+        -Recurse `
+        -Force `
+        -ErrorAction SilentlyContinue
 }
